@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --text:#e6e9ef; --dim:#8b93a3; --accent:#5b9dff; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:15px/1.5 -apple-system,system-ui,sans-serif; min-height:100vh; }
+  header { display:flex; gap:4px; padding:14px 20px 0; border-bottom:1px solid var(--line); }
+  .tab { padding:10px 18px; color:var(--dim); cursor:pointer; border:1px solid transparent; border-bottom:none; border-radius:8px 8px 0 0; user-select:none; }
+  .tab.active { background:var(--card); border-color:var(--line); color:var(--text); }
+  main { padding:20px; max-width:1100px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:16px; }
+  textarea { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:12px; font:inherit; resize:vertical; min-height:70px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 22px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  .row { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; }
+  .row > * { flex:1; min-width:320px; }
+  h3 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin-bottom:10px; }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; }
+  th { color:var(--dim); font-weight:600; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; font-size:12.5px; overflow-x:auto; color:#a5d6ff; }
+  #err { color:#ff7b72; }
+  #status { margin-left:auto; display:flex; align-items:center; padding:0 6px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .hidden { display:none; }
+  .chart { display:flex; justify-content:center; }
+  .examples { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+  .ex { font-size:12.5px; color:var(--dim); border:1px solid var(--line); border-radius:99px; padding:4px 12px; cursor:pointer; }
+  .ex:hover { color:var(--text); border-color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <div class="tab active" data-tab="dash">Dashboard</div>
+  <div class="tab" data-tab="er">ER</div>
+  <div id="status" title="checking…"><span class="dot" style="background:#666"></span></div>
+</header>
+<main>
+  <section id="dash">
+    <div class="card">
+      <textarea id="q" placeholder="Ask anything about your data… e.g. revenue by product category per customer country"></textarea>
+      <div class="examples">
+        <span class="ex">Revenue by product category per customer country</span>
+        <span class="ex">Average salary per department</span>
+        <span class="ex">Top 5 customers by total order value</span>
+        <span class="ex">Orders per month</span>
+      </div>
+      <div style="margin-top:12px"><button id="go">Ask</button> <span id="err"></span></div>
+    </div>
+    <div id="out"></div>
+  </section>
+  <section id="er" class="hidden">
+    <div class="card"><h3>Entity Relationships</h3><div id="erbox">Loading…</div></div>
+  </section>
+</main>
+<script>
+mermaid.initialize({ startOnLoad:false, theme:"dark", er:{ fontSize:12 } });
+
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+  t.classList.add("active");
+  document.getElementById("dash").classList.toggle("hidden", t.dataset.tab !== "dash");
+  document.getElementById("er").classList.toggle("hidden", t.dataset.tab !== "er");
+  if (t.dataset.tab === "er") loadER();
+});
+
+document.querySelectorAll(".ex").forEach(e => e.onclick = () => { q.value = e.textContent; });
+
+function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
+function isNum(v) { return typeof v === "number" || (v !== null && v !== "" && !isNaN(v)); }
+function cells(r, cols) { return Array.isArray(r) ? r : cols.map(c => r[c]); }
+
+async function health() {
+  const el = document.getElementById("status");
+  const color = { up: "#3fb950", down: "#ff7b72", wait: "#666" };
+  const set = (c, tip) => { el.innerHTML = `<span class="dot" style="background:${c}"></span>`; el.title = tip; };
+  try {
+    const r = await fetch("/api/health");
+    const d = await r.json();
+    if (d.opencode && d.db) set(color.up, "opencode + database: connected");
+    else if (!d.opencode && !d.db) set(color.down, "opencode AND database down");
+    else if (!d.opencode) set(color.down, "opencode down — run: opencode serve --port 4096");
+    else set(color.down, "database down: " + d.detail.db);
+  } catch { set(color.down, "dashboard server unreachable"); }
+}
+health();
+setInterval(health, 15000);
+
+function show(html) { document.getElementById("out").innerHTML = html; }
+
+async function ask() {
+  const btn = document.getElementById("go"), err = document.getElementById("err");
+  const question = document.getElementById("q").value.trim();
+  if (!question) return;
+  btn.disabled = true; err.textContent = ""; show(`<div class="card"><em>Thinking — agent is inspecting schema and building SQL…</em></div>`);
+  try {
+    const r = await fetch("/api/ask", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ question }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    show(render(d));
+    const pre = document.querySelector("#out pre.mermaid");
+    if (pre) {
+      try {
+        await mermaid.run({ nodes: [pre] });
+      } catch (e) {
+        pre.replaceWith(document.createTextNode("chart render failed: " + e.message));
+      }
+    }
+  } catch (e) { err.textContent = "Error: " + e.message; show(""); }
+  btn.disabled = false;
+}
+document.getElementById("go").onclick = ask;
+document.getElementById("q").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask(); });
+
+function chartSpec(d) {
+  // make any agent/data input renderable: quotes->', strip control chars, coerce type, cap points, positive pie values
+  const clean = s => String(s ?? "").replace(/"/g, "'").replace(/[\x00-\x1f]/g, " ").trim();
+  const type = ["bar", "line", "pie"].includes(d.chart?.type) ? d.chart.type : "bar";
+  const title = clean(d.chart?.title) || "Chart";
+  const x = clean(d.chart?.x), y = clean(d.chart?.y);
+  const cols = Array.isArray(d.columns) ? d.columns : [];
+  const rows = Array.isArray(d.rows) ? d.rows.slice(0, 15) : [];
+  const xi = cols.indexOf(x), yi = cols.indexOf(y);
+  if (xi < 0 || yi < 0 || rows.length === 0) return null;
+  const labels = rows.map(r => clean(cells(r, cols)[xi]).slice(0, 14)), vals = rows.map(r => Number(cells(r, cols)[yi]) || 0);
+  if (type === "pie") {
+    const pts = labels.map((l, i) => [l || "n/a", vals[i]]).filter(([, v]) => v > 0);
+    if (pts.length === 0) return null;
+    return `pie title ${title}\n` + pts.map(([l, v]) => `"${l}" : ${v}`).join("\n");
+  }
+  const ymax = Math.ceil(Math.max(...vals, 0) * 1.1) || 1;
+  return `xychart-beta\ntitle "${title}"\nx-axis [${labels.map(l => `"${l}"`).join(", ")}]\ny-axis "${y}" 0 --> ${ymax}\n${type === "line" ? "line" : "bar"} [${vals.join(", ")}]`;
+}
+
+function render(d) {
+  const spec = d.chart ? chartSpec(d) : null;
+  let h = `<div class="card"><div class="row">
+    <div><h3>Answer</h3><p>${esc(d.summary)}</p>
+      ${spec ? `<div class="chart" id="chart"><pre class="mermaid">${esc(spec)}</pre></div>` : ""}
+    </div>
+    <div><h3>SQL</h3><pre>${esc(d.sql)}</pre></div>
+  </div></div>`;
+  h += `<div class="card"><h3>Result (${d.rows.length} rows)</h3><div style="overflow-x:auto"><table><tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>` +
+    d.rows.map(r => `<tr>${cells(r, d.columns).map(v => `<td class="${isNum(v) ? "num" : ""}">${esc(v)}</td>`).join("")}</tr>`).join("") + `</table></div></div>`;
+  return h;
+}
+
+async function loadER() {
+  const box = document.getElementById("erbox");
+  if (box.dataset.done) return;
+  try {
+    const r = await fetch("/api/er");
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    box.innerHTML = `<pre class="mermaid">${esc(d.mermaid)}</pre>`;
+    await mermaid.run({ nodes:[box.firstChild] });
+    box.dataset.done = 1;
+  } catch (e) { box.textContent = "Error: " + e.message; }
+}
+</script>
+</body>
+</html>
