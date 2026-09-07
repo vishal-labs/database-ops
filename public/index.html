@@ -26,8 +26,19 @@
   td.num { text-align:right; font-variant-numeric:tabular-nums; }
   pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; font-size:12.5px; overflow-x:auto; color:#a5d6ff; }
   #err { color:#ff7b72; }
-  #status { margin-left:auto; display:flex; align-items:center; padding:0 6px; }
+  #status { display:flex; align-items:center; padding:0 6px; }
   .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  #wmode { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12.5px; color:var(--dim); cursor:pointer; user-select:none; }
+  #wmode input { appearance:none; width:34px; height:19px; border-radius:99px; background:var(--line); position:relative; cursor:pointer; transition:.15s; margin:0; }
+  #wmode input::after { content:""; position:absolute; width:15px; height:15px; border-radius:50%; background:#8b93a3; top:2px; left:2px; transition:.15s; }
+  #wmode input:checked { background:#4a1717; }
+  #wmode input:checked::after { left:17px; background:#ff7b72; }
+  #wmode.on span { color:#ff7b72; }
+  #prog { list-style:none; padding:0; font-size:13px; color:var(--dim); }
+  #prog li { padding:1px 0; }
+  .btn2 { background:var(--line); color:var(--text); margin-left:8px; }
+  .btnrun { background:#b62324; }
+  .btnrow { margin-top:12px; }
   .hidden { display:none; }
   .chart { display:flex; justify-content:center; }
   .examples { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
@@ -39,6 +50,9 @@
 <header>
   <div class="tab active" data-tab="dash">Dashboard</div>
   <div class="tab" data-tab="er">ER</div>
+  <label id="wmode" title="Let the agent prepare INSERT/UPDATE/DELETE/DDL statements. Every statement still requires your explicit confirmation before it runs.">
+    <input type="checkbox" id="writeToggle"><span>write mode</span>
+  </label>
   <div id="status" title="checking…"><span class="dot" style="background:#666"></span></div>
 </header>
 <main>
@@ -92,28 +106,69 @@ async function health() {
 health();
 setInterval(health, 15000);
 
+// --- write mode toggle ---
+const wt = document.getElementById("writeToggle"), wmode = document.getElementById("wmode");
+wt.onchange = async () => {
+  const want = wt.checked ? "write" : "read";
+  const r = await fetch("/api/mode", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ mode: want }) });
+  const d = await r.json();
+  if (!r.ok) { wt.checked = !wt.checked; err.textContent = "Error: " + d.error; return; }
+  wmode.classList.toggle("on", wt.checked);
+};
+fetch("/api/mode").then(r => r.json()).then(d => {
+  wt.checked = d.mode === "write";
+  wmode.classList.toggle("on", wt.checked);
+});
+
 function show(html) { document.getElementById("out").innerHTML = html; }
+
+function progLine(p) {
+  const li = document.createElement("li");
+  if (p.stage) { li.textContent = "⚠ " + (p.stage === "retrying" ? "SQL failed — agent is fixing it with the database error…" : p.stage); }
+  else {
+    const name = (p.tool || "").replace(/^postgres_/, "").replace(/_/g, " ");
+    li.textContent = (p.status === "completed" ? "✓ " : "→ ") + name + (p.status === "completed" ? "" : "…");
+  }
+  document.getElementById("prog")?.appendChild(li);
+}
 
 async function ask() {
   const btn = document.getElementById("go"), err = document.getElementById("err");
   const question = document.getElementById("q").value.trim();
   if (!question) return;
-  btn.disabled = true; err.textContent = ""; show(`<div class="card"><em>Thinking — agent is inspecting schema and building SQL…</em></div>`);
+  btn.disabled = true; err.textContent = "";
+  show(`<div class="card"><h3>Progress</h3><ul id="prog"><li>→ asking agent…</li></ul></div>`);
   try {
-    const r = await fetch("/api/ask", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ question }) });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error);
-    show(render(d));
-    const pre = document.querySelector("#out pre.mermaid");
-    if (pre) {
-      try {
-        await mermaid.run({ nodes: [pre] });
-      } catch (e) {
-        pre.replaceWith(document.createTextNode("chart render failed: " + e.message));
+    const res = await fetch("/api/ask", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ question, stream: true }) });
+    if (!res.ok || !res.body) { const d = await res.json().catch(() => ({})); throw new Error(d.error || res.statusText); }
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (!line) continue;
+        const evt = JSON.parse(line);
+        if (evt.progress) progLine(evt.progress);
+        if (evt.error) throw new Error(evt.error);
+        if (evt.result) {
+          show(render(evt.result));
+          if (evt.result.needsConfirmation) wireConfirm(evt.result); else await runCharts();
+        }
       }
     }
   } catch (e) { err.textContent = "Error: " + e.message; show(""); }
   btn.disabled = false;
+}
+
+async function runCharts() {
+  const pre = document.querySelector("#out pre.mermaid");
+  if (!pre) return;
+  try { await mermaid.run({ nodes: [pre] }); }
+  catch (e) { pre.replaceWith(document.createTextNode("chart render failed: " + e.message)); }
 }
 document.getElementById("go").onclick = ask;
 document.getElementById("q").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) ask(); });
@@ -139,6 +194,7 @@ function chartSpec(d) {
 }
 
 function render(d) {
+  if (d.needsConfirmation) return confirmCard(d);
   const spec = d.chart ? chartSpec(d) : null;
   let h = `<div class="card"><div class="row">
     <div><h3>Answer</h3><p>${esc(d.summary)}</p>
@@ -146,9 +202,41 @@ function render(d) {
     </div>
     <div><h3>SQL</h3><pre>${esc(d.sql)}</pre></div>
   </div></div>`;
-  h += `<div class="card"><h3>Result (${d.rows.length} rows)</h3><div style="overflow-x:auto"><table><tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>` +
-    d.rows.map(r => `<tr>${cells(r, d.columns).map(v => `<td class="${isNum(v) ? "num" : ""}">${esc(v)}</td>`).join("")}</tr>`).join("") + `</table></div></div>`;
+  h += d.rows.length
+    ? `<div class="card"><h3>Result (${d.rows.length} rows)</h3><div style="overflow-x:auto"><table><tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>` +
+      d.rows.map(r => `<tr>${cells(r, d.columns).map(v => `<td class="${isNum(v) ? "num" : ""}">${esc(v)}</td>`).join("")}</tr>`).join("") + `</table></div></div>`
+    : `<div class="card"><h3>Result</h3><p>${d.rowCount ?? 0} row(s) affected.</p></div>`;
   return h;
+}
+
+function confirmCard(d) {
+  return `<div class="card" id="confirmcard">
+    <h3>Confirmation required</h3>
+    <p>${esc(d.summary)}</p>
+    <pre>${esc(d.sql)}</pre>
+    <div class="btnrow">
+      <button class="btnrun" id="doit">Run statement</button>
+      <button class="btn2" id="cancelit">Cancel</button>
+    </div>
+  </div>`;
+}
+
+function wireConfirm(d) {
+  const card = document.getElementById("confirmcard");
+  document.getElementById("cancelit").onclick = () => show("");
+  document.getElementById("doit").onclick = async () => {
+    const b = document.getElementById("doit");
+    b.disabled = true; b.textContent = "Running…";
+    const r = await fetch("/api/execute", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ sql: d.sql }) });
+    const res = await r.json();
+    if (!r.ok) {
+      b.disabled = false; b.textContent = "Run statement";
+      card.insertAdjacentHTML("beforeend", `<p id="err">Error: ${esc(res.error)}</p>`);
+      return;
+    }
+    show(render({ ...d, needsConfirmation: false, ...res }));
+    await runCharts();
+  };
 }
 
 async function loadER() {

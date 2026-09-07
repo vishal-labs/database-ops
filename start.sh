@@ -34,15 +34,14 @@ if ! container exec "$PG_NAME" psql -U vishal -d vishal -tAc "SELECT 1 FROM info
 fi
 
 # --- 3. postgres-mcp container (SSE server on :8000) ---
-if container ls -a --format json | grep -q "\"$MCP_NAME\""; then
-  container ls --format json | grep -q "\"$MCP_NAME\"" || { log "starting $MCP_NAME"; container start "$MCP_NAME"; }
-else
-  log "creating $MCP_NAME"
-  container run -d --name "$MCP_NAME" \
-    -e DATABASE_URI="postgresql://vishal:password@$PG_IP:5432/vishal" \
-    -p 8000:8000 \
-    crystaldba/postgres-mcp --access-mode=restricted --transport=sse
-fi
+# Always recreated: it is stateless, and a started-again container would keep a stale
+# DATABASE_URI pointing at an old postgres IP.
+container rm -f "$MCP_NAME" >/dev/null 2>&1 || true
+log "creating $MCP_NAME"
+container run -d --name "$MCP_NAME" \
+  -e DATABASE_URI="postgresql://vishal:password@$PG_IP:5432/vishal" \
+  -p 8000:8000 \
+  crystaldba/postgres-mcp --access-mode=restricted --transport=sse
 
 # --- 4. opencode serve ---
 if ! pgrep -f "opencode serve" >/dev/null; then
