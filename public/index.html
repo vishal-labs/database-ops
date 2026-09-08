@@ -81,7 +81,13 @@
     <div id="out"></div>
   </section>
   <section id="er" class="hidden">
-    <div class="card"><h3>Entity Relationships</h3><div id="erbox">Loading…</div></div>
+    <div class="card">
+      <div style="display:flex;align-items:center;margin-bottom:10px">
+        <h3 style="margin:0">Entity Relationships</h3>
+        <button id="errefresh" class="btn2" style="margin-left:auto;padding:6px 14px;font-size:12.5px">Refresh</button>
+      </div>
+      <div id="erbox">Loading…</div>
+    </div>
   </section>
   <section id="manage" class="hidden">
     <div class="card">
@@ -279,9 +285,11 @@ function wireConfirm(d) {
   };
 }
 
-async function loadER() {
+async function loadER(force = false) {
   const box = document.getElementById("erbox");
-  if (box.dataset.done) return;
+  if (box.dataset.done && !force) return;
+  box.dataset.done = "";
+  box.textContent = "Loading…";
   try {
     const r = await fetch("/api/er");
     const d = await r.json();
@@ -291,6 +299,7 @@ async function loadER() {
     box.dataset.done = 1;
   } catch (e) { box.textContent = "Error: " + e.message; }
 }
+document.getElementById("errefresh").onclick = () => loadER(true);
 
 // ---------- manage tab ----------
 async function loadManage() { loadSnaps(); loadMigs(); }
