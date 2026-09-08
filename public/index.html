@@ -40,7 +40,8 @@
   .btnrun { background:#b62324; }
   .btnrow { margin-top:12px; }
   .hidden { display:none; }
-  .chart { display:flex; justify-content:center; }
+  .chart { display:block; }
+  .chart svg { width:100% !important; max-width:100% !important; height:auto !important; }
   .examples { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
   .ex { font-size:12.5px; color:var(--dim); border:1px solid var(--line); border-radius:99px; padding:4px 12px; cursor:pointer; }
   .ex:hover { color:var(--text); border-color:var(--accent); }
@@ -89,6 +90,16 @@ document.querySelectorAll(".ex").forEach(e => e.onclick = () => { q.value = e.te
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
 function isNum(v) { return typeof v === "number" || (v !== null && v !== "" && !isNaN(v)); }
 function cells(r, cols) { return Array.isArray(r) ? r : cols.map(c => r[c]); }
+
+function fmtSql(sql) {
+  // pretty-print for display only: newline before major clauses, joins indented.
+  // ponytail: keyword scanner, literals not protected — cosmetic, never executed.
+  return String(sql || "")
+    .replace(/\s+/g, " ")
+    .replace(/\b(FROM|WHERE|GROUP BY|HAVING|ORDER BY|LIMIT|OFFSET|UNION ALL|UNION|INTERSECT|EXCEPT|VALUES|RETURNING|SET)\b/gi, "\n$1")
+    .replace(/\b((?:LEFT|RIGHT|FULL|INNER|CROSS(?: OUTER)?)\s+)?JOIN\b/gi, m => "\n  " + m.toUpperCase())
+    .trim();
+}
 
 async function health() {
   const el = document.getElementById("status");
@@ -196,16 +207,15 @@ function chartSpec(d) {
 function render(d) {
   if (d.needsConfirmation) return confirmCard(d);
   const spec = d.chart ? chartSpec(d) : null;
-  let h = `<div class="card"><div class="row">
-    <div><h3>Answer</h3><p>${esc(d.summary)}</p>
-      ${spec ? `<div class="chart" id="chart"><pre class="mermaid">${esc(spec)}</pre></div>` : ""}
-    </div>
-    <div><h3>SQL</h3><pre>${esc(d.sql)}</pre></div>
-  </div></div>`;
-  h += d.rows.length
+  const h = `<div class="card"><div class="row">
+    <div><h3>Answer</h3><p>${esc(d.summary)}</p></div>
+    <div><h3>SQL</h3><pre>${esc(fmtSql(d.sql))}</pre></div>
+  </div></div>` +
+  (spec ? `<div class="card"><h3>Chart</h3><div class="chart" id="chart"><pre class="mermaid">${esc(spec)}</pre></div></div>` : "") +
+  (d.rows.length
     ? `<div class="card"><h3>Result (${d.rows.length} rows)</h3><div style="overflow-x:auto"><table><tr>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>` +
       d.rows.map(r => `<tr>${cells(r, d.columns).map(v => `<td class="${isNum(v) ? "num" : ""}">${esc(v)}</td>`).join("")}</tr>`).join("") + `</table></div></div>`
-    : `<div class="card"><h3>Result</h3><p>${d.rowCount ?? 0} row(s) affected.</p></div>`;
+    : `<div class="card"><h3>Result</h3><p>${d.rowCount ?? 0} row(s) affected.</p></div>`);
   return h;
 }
 
@@ -213,7 +223,7 @@ function confirmCard(d) {
   return `<div class="card" id="confirmcard">
     <h3>Confirmation required</h3>
     <p>${esc(d.summary)}</p>
-    <pre>${esc(d.sql)}</pre>
+    <pre>${esc(fmtSql(d.sql))}</pre>
     <div class="btnrow">
       <button class="btnrun" id="doit">Run statement</button>
       <button class="btn2" id="cancelit">Cancel</button>
