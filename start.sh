@@ -43,10 +43,20 @@ container run -d --name "$MCP_NAME" \
   -p 8000:8000 \
   crystaldba/postgres-mcp --access-mode=restricted --transport=sse
 
+# Run a command in a new session so aborting the parent shell cannot kill it.
+start_detached() {
+  local log="$1"; shift
+  python3 - "$log" "$@" <<'PYEOF' >/dev/null 2>&1
+import subprocess, sys
+with open(sys.argv[1], "a") as f:
+    subprocess.Popen(sys.argv[2:], stdout=f, stderr=f, start_new_session=True)
+PYEOF
+}
+
 # --- 4. opencode serve ---
 if ! pgrep -f "opencode serve" >/dev/null; then
   log "starting opencode serve"
-  nohup opencode serve --port 4096 > logs/opencode-serve.log 2>&1 &
+  start_detached logs/opencode-serve.log opencode serve --port 4096
   for i in {1..15}; do
     curl -sf http://localhost:4096/global/health >/dev/null && break
     [ "$i" -eq 15 ] && { log "opencode serve never became healthy"; exit 1; }
@@ -59,7 +69,7 @@ log "opencode serve up"
 pkill -f "node server.js" 2>/dev/null || true
 sleep 1
 DATABASE_URL="postgresql://vishal:password@$PG_IP:5432/vishal" \
-  nohup node server.js > logs/dashboard-server.log 2>&1 &
+  start_detached logs/dashboard-server.log node server.js
 for i in {1..10}; do
   curl -sf http://localhost:3000/api/health >/dev/null && break
   [ "$i" -eq 10 ] && { log "dashboard server failed, see logs/dashboard-server.log"; exit 1; }

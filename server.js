@@ -1,11 +1,19 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import pg from "pg";
+
+const runCmd = promisify(execFile);
 
 const PORT = 3000;
 const OPENCODE = process.env.OPENCODE_URL || "http://localhost:4096";
 const DB = process.env.DATABASE_URL || "postgresql://vishal:password@192.168.64.7:5432/vishal";
+const PG_NAME = process.env.PG_CONTAINER || "postgres-container";
+const MCP_NAME = process.env.MCP_CONTAINER || "postgres-mcp";
+const SNAPDIR = path.join(import.meta.dirname, "snapshots");
+const MIGDIR = path.join(import.meta.dirname, "migrations");
 const MAX_PROGRESS = 60; // cap progress events per question
 
 const COMMON_RULES = `Rules:
@@ -41,6 +49,20 @@ ${COMMON_RULES}
 
 Request: ${q}`,
 };
+
+const MIGRATE_PROMPT = q => `You are a database migration agent for a PostgreSQL database. Use your Postgres MCP tools (list_schemas, list_objects, get_object_details) to inspect the current schema, then draft a SQL migration that fulfils the request.
+
+Rules:
+- The migration SQL may contain MULTIPLE statements separated by semicolons.
+- Prefer IF EXISTS / IF NOT EXISTS guards so the migration is idempotent.
+- Do NOT execute any write statement via MCP; use execute_sql only to inspect the schema or validate SELECT queries.
+- The migration is saved to a file and applied by a separate tracked migrator, not by you.
+- Reply with ONLY a single fenced json block, nothing else:
+\`\`\`json
+{ "summary": "one-sentence description of what this migration does", "sql": "the migration SQL (may be multi-statement)" }
+\`\`\`
+
+Request: ${q}`;
 
 let sessionId = null;
 let mode = "read"; // resets to read-only on restart by design
@@ -81,12 +103,12 @@ function extractJson(text) {
   return JSON.parse(m[1]);
 }
 
-async function askAgent(question, currentMode, onProgress) {
-  log(`asking agent (${currentMode}):`, question);
+async function askAgent(promptText) {
+  log("asking agent:", JSON.stringify(promptText.slice(0, 120)));
   const send = async () => {
     const id = await getSession();
     return opencode("POST", `/session/${id}/message`, {
-      parts: [{ type: "text", text: PROMPTS[currentMode](question) }],
+      parts: [{ type: "text", text: promptText }],
     });
   };
   let msg;
@@ -105,6 +127,12 @@ async function askAgent(question, currentMode, onProgress) {
     .join("\n");
   log("agent reply (first 300):", JSON.stringify(text.slice(0, 300)));
   return extractJson(text);
+}
+
+async function withAgentBusy(fn) {
+  if (busy) throw Object.assign(new Error("agent is already working on a request — wait for it to finish"), { status: 409 });
+  busy = true;
+  try { return await fn(); } finally { busy = false; }
 }
 
 // Subscribe to opencode's SSE bus and surface this session's MCP tool activity.
@@ -166,14 +194,24 @@ function classifySql(sql) {
 async function execTx(sql, writable) {
   const client = new pg.Client({ connectionString: DB });
   await client.connect();
-  try {
-    await client.query(writable ? "BEGIN" : "BEGIN READ ONLY");
+  const run = async inTx => {
+    if (inTx) await client.query(writable ? "BEGIN" : "BEGIN READ ONLY");
     const r = await client.query(sql);
-    await client.query(writable ? "COMMIT" : "ROLLBACK");
+    if (inTx) await client.query(writable ? "COMMIT" : "ROLLBACK");
     return r;
-  } catch (e) {
-    try { await client.query("ROLLBACK"); } catch {}
-    throw e;
+  };
+  try {
+    try {
+      return await run(true); // reads: BEGIN READ ONLY; writes: BEGIN/COMMIT
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch {}
+      // some write statements (CREATE DATABASE, VACUUM, ...) cannot run in a transaction block
+      if (writable && /inside a transaction/i.test(e.message)) {
+        log("statement cannot run in a transaction; retrying autocommit");
+        return await run(false);
+      }
+      throw e;
+    }
   } finally {
     await client.end();
   }
@@ -231,7 +269,7 @@ function readBody(req) {
 async function planAndRun(question, currentMode, onProgress) {
   let extra = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const plan = await askAgent(extra ? question + extra : question, currentMode);
+    const plan = await askAgent(extra ? PROMPTS[currentMode](question + extra) : PROMPTS[currentMode](question));
     if (!plan.sql || typeof plan.sql !== "string")
       throw new Error(`agent could not produce SQL: ${plan.summary || "(no summary)"}`);
     const kind = classifySql(plan.sql);
@@ -340,6 +378,92 @@ const server = http.createServer(async (req, res) => {
       const kind = classifySql(sql);
       if (kind !== "write") return json(400, { error: `refusing to run ${kind} statement` });
       return json(200, await runSql(sql, true));
+    }
+
+    // ---------- manage: snapshots ----------
+    if (req.method === "GET" && url.pathname === "/api/snapshots") {
+      fs.mkdirSync(SNAPDIR, { recursive: true });
+      const snapshots = fs.readdirSync(SNAPDIR)
+        .filter(f => f.endsWith(".sql"))
+        .map(f => {
+          const st = fs.statSync(path.join(SNAPDIR, f));
+          return { name: f, size: st.size, created: st.mtime };
+        })
+        .sort((a, b) => b.created - a.created);
+      return json(200, { snapshots });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/snapshot") {
+      fs.mkdirSync(SNAPDIR, { recursive: true });
+      const name = `db-${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16)}.sql`;
+      const { stdout } = await runCmd("container", ["exec", PG_NAME, "pg_dump", "-U", "vishal", "-d", "vishal"], { maxBuffer: 1e9 });
+      if (!stdout.trim()) throw new Error("pg_dump produced no output");
+      fs.writeFileSync(path.join(SNAPDIR, name), stdout);
+      log("snapshot saved:", name, `${(stdout.length / 1024).toFixed(1)} KB`);
+      return json(200, { name, size: stdout.length });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/restore") {
+      if (mode !== "write") return json(403, { error: "restore requires write mode (it drops the current database)" });
+      const { file } = await readBody(req);
+      if (typeof file !== "string" || file.includes("/") || file.includes("..") || !file.endsWith(".sql"))
+        return json(400, { error: "invalid snapshot name" });
+      const dump = path.join(SNAPDIR, file);
+      if (!fs.existsSync(dump)) return json(404, { error: "snapshot not found" });
+      log("RESTORING from", file, "(drops current database)");
+      const output = await new Promise((ok, err) => {
+        const proc = spawn("container", ["exec", "-i", PG_NAME, "sh", "-c",
+          'psql -U vishal -d postgres -q -c "DROP DATABASE IF EXISTS vishal WITH (FORCE)" && createdb -U vishal vishal && psql -U vishal -d vishal -q -v ON_ERROR_STOP=1']);
+        fs.createReadStream(dump).pipe(proc.stdin);
+        let out = "";
+        proc.stdout.on("data", d => (out += d));
+        proc.stderr.on("data", d => (out += d));
+        proc.on("close", code => (code ? err(new Error(out.slice(-500))) : ok(out)));
+      });
+      // recreate the MCP container connection: restart it so its pool points at the fresh database
+      await runCmd("container", ["restart", MCP_NAME]).catch(e => log("MCP restart failed:", e.message));
+      log("restore complete");
+      return json(200, { ok: true, output: output.slice(-500) });
+    }
+
+    // ---------- manage: migrations ----------
+    if (req.method === "GET" && url.pathname === "/api/migrations") {
+      fs.mkdirSync(MIGDIR, { recursive: true });
+      let applied = [];
+      try {
+        applied = (await execTx("SELECT name FROM schema_migrations", false)).rows.map(r => r.name);
+      } catch { applied = []; }
+      const migrations = fs.readdirSync(MIGDIR).filter(f => f.endsWith(".sql")).sort()
+        .map(f => ({ name: f, applied: applied.includes(f) }));
+      return json(200, { migrations });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/migrate/draft") {
+      const { request } = await readBody(req);
+      if (!request?.trim()) return json(400, { error: "request required" });
+      const plan = await withAgentBusy(() => askAgent(MIGRATE_PROMPT(request)));
+      if (!plan.sql || typeof plan.sql !== "string")
+        throw new Error(`agent could not draft a migration: ${plan.summary || "(no summary)"}`);
+      return json(200, { summary: plan.summary || "", sql: plan.sql });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/migrate/save") {
+      const { summary, sql } = await readBody(req);
+      if (!sql?.trim()) return json(400, { error: "sql required" });
+      fs.mkdirSync(MIGDIR, { recursive: true });
+      const existing = fs.readdirSync(MIGDIR).filter(f => f.endsWith(".sql"));
+      const num = String(existing.length + 1).padStart(3, "0");
+      const slug = String(summary || "migration").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 40) || "migration";
+      const name = `${num}_${slug}.sql`;
+      fs.writeFileSync(path.join(MIGDIR, name), `-- drafted by agent: ${summary || "(unlabeled)"}\n${sql.trim()}\n`);
+      log("migration saved:", name);
+      return json(200, { name });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/migrate/apply") {
+      const { stdout } = await runCmd("bash", [path.join(import.meta.dirname, "migrate.sh")], { cwd: import.meta.dirname, maxBuffer: 1e7 });
+      log("migrations applied");
+      return json(200, { output: stdout });
     }
 
     if (req.method === "GET" && url.pathname === "/api/er")
