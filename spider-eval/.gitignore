@@ -1,0 +1,8 @@
+dataset/database/
+dataset/*.json
+dataset/*.sql
+results/*.jsonl
+results/*.json
+results/*.csv
+!dataset/.gitkeep
+!results/.gitkeep
