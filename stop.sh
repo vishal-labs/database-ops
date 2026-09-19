@@ -8,8 +8,8 @@ pkill -f "node server.js" && log "dashboard server stopped" || log "dashboard se
 pkill -f "opencode serve" && log "opencode serve stopped" || log "opencode serve not running"
 
 for name in postgres-mcp postgres-container; do
-  if container ls --format json | grep -q "\"$name\""; then
-    container stop "$name" >/dev/null && log "$name stopped"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
+    docker stop "$name" >/dev/null && log "$name stopped"
   else
     log "$name not running"
   fi
