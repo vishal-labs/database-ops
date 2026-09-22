@@ -7,12 +7,14 @@
 
 ## Abstract
 
-This project reproduces — with entirely free and open-source components — the "agentic database" experience demonstrated by commercial data-warehouse vendors (e.g., Exasol's Claude Code demo): a user types a question in plain English, an AI agent inspects the database metadata, writes and validates SQL, executes it, and the results are rendered as an answer, a chart, and a shareable dashboard view — plus a standalone ER diagram generated from live schema metadata.
+This project reproduces — with entirely free and open-source components — the "agentic database" experience demonstrated by commercial data-warehouse vendors: a user types a question in plain English, an AI agent inspects the database metadata, writes and validates SQL, executes it, and the results are rendered as an answer, a chart, and a shareable dashboard view — plus a standalone ER diagram generated from live schema metadata. **Privacy** was the main focus and the entire DB engine is built around it, none of the Query Responses, parse through the Agent. 
 
-The system runs entirely on a local Mac. A PostgreSQL database and an MCP server each run as containers on Apple's native container runtime; the agent reasoning is delegated to an opencode session; a thin Node.js server (≈250 lines) orchestrates the flow and enforces a strict safety model; the frontend is a single static HTML page. Three properties were treated as non-negotiable design constraints: **(1)** the agent can *plan* SQL but never *executes* writes — every write passes through an explicit user-confirmation gate backed by a SQL classifier and read-only transactions; **(2)** result data flows to the UI deterministically (browser → server → database) without being relayed through the LLM; **(3)** the whole stack is reproducible with two scripts (`start.sh` / `stop.sh`) that are resilient to reboots, container IP changes, and stale connections.
+The system runs entirely on a local Mac. A PostgreSQL database and an MCP server each run as containers on Apple's native container runtime; the agent reasoning is delegated to an opencode session; a thin Node.js server orchestrates the flow and enforces a strict safety model; the frontend is a single static HTML page. Three properties were treated as non-negotiable design constraints: **(1)** the agent can *plan* SQL but never *executes* writes — every write passes through an explicit user-confirmation gate backed by a SQL classifier and read-only transactions; **(2)** result data flows to the UI deterministically (browser → server → database) without being relayed through the LLM; **(3)** the whole stack is reproducible with two scripts (`start.sh` / `stop.sh`) that are resilient to reboots, container IP changes, and stale connections.
 
 ---
+<img width="415" height="676" alt="image" src="https://github.com/user-attachments/assets/40edace1-0915-42b7-b976-9a7e792f2da9" />
 
+---
 ## 1. Motivation
 
 The reference demo (Exasol + Claude Code) showed an agent that: (a) had access to table metadata across many tables, (b) prepared and executed SQL from natural language, and (c) built dashboards on top of the results. Exasol itself is a paid, proprietary analytics database — the *demo pattern*, however, is not Exasol-specific. This project implements the same pattern on commodity PostgreSQL at zero license cost.
